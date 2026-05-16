@@ -94,12 +94,13 @@ fun IMURecorderScreen(
     var magText by remember { mutableStateOf("Mag: Waiting...") }
     var hzText by remember { mutableStateOf("Rate: 0.0 Hz") }
     var statusText by remember { mutableStateOf("Status: Not Connected") }
+    var triggerCount by remember { mutableIntStateOf(0) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         if (!isGranted) {
-            Toast.makeText(context, "Notification permission required", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, "Permission required", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -108,6 +109,7 @@ fun IMURecorderScreen(
             while (true) {
                 isRecording = imuService.isRecording()
                 statusText = if (isRecording) "Status: RECORDING" else "Status: READY"
+                triggerCount = imuService.getTriggerCount()
                 
                 val accel = imuService.getCurrentAccel()
                 accelText = String.format(Locale.US, "Accel (g): X: %.3f, Y: %.3f, Z: %.3f", accel[0], accel[1], accel[2])
@@ -137,7 +139,13 @@ fun IMURecorderScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Text(text = statusText, style = MaterialTheme.typography.headlineSmall)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(text = statusText, style = MaterialTheme.typography.headlineSmall)
+            Text(text = "Triggers: $triggerCount", style = MaterialTheme.typography.headlineSmall)
+        }
         
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(12.dp)) {
@@ -191,6 +199,21 @@ fun IMURecorderScreen(
             ) {
                 Text("Stop")
             }
+        }
+
+        Button(
+            onClick = {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                    permissionLauncher.launch(Manifest.permission.CAMERA)
+                } else {
+                    imuService?.incrementTrigger()
+                }
+            },
+            enabled = isBound,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+        ) {
+            Text("Manual Trigger")
         }
 
         Button(

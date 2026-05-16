@@ -4,6 +4,9 @@ import android.app.*
 import android.content.*
 import android.content.pm.ServiceInfo
 import android.hardware.*
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.*
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
@@ -11,6 +14,7 @@ import java.io.*
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 class IMURecorderService : Service(), SensorEventListener {
@@ -42,6 +46,12 @@ class IMURecorderService : Service(), SensorEventListener {
     private var lastAccel = FloatArray(3)
     private var lastGyro = FloatArray(3)
     private var lastMag = FloatArray(3)
+
+    // Trigger logic
+    private var triggerCount = 0
+    private var conditionStartTime: Long = 0
+    private val conditionDurationThreshold = 30000L // 30 seconds
+    private var isConditionMet = false
 
     inner class LocalBinder : Binder() {
         fun getService(): IMURecorderService = this@IMURecorderService
@@ -120,6 +130,9 @@ class IMURecorderService : Service(), SensorEventListener {
         sampleCount = 0
         lastHzCalcTime = SystemClock.elapsedRealtime()
         currentHz = 0.0
+        triggerCount = 0
+        conditionStartTime = 0
+        isConditionMet = false
         isRecording = true
         wakeLock?.acquire()
         startForegroundServiceInternal()
@@ -185,17 +198,33 @@ class IMURecorderService : Service(), SensorEventListener {
                     sampleCount = 0
                     lastHzCalcTime = now
                 }
+
+                val am = sqrt(lastAccel[0]*lastAccel[0] + lastAccel[1]*lastAccel[1] + lastAccel[2]*lastAccel[2])
+                
+                // Stand upright condition: Mag ~ 1g AND -accelY ~ 1g
+                val currentConditionMet = abs(am - 1.0f) < 0.15f && abs(-lastAccel[1] - 1.0f) < 0.15f
+                
+                if (currentConditionMet) {
+                    if (!isConditionMet) {
+                        isConditionMet = true
+                        conditionStartTime = now
+                    } else if (now - conditionStartTime > conditionDurationThreshold) {
+                        incrementTrigger()
+                        conditionStartTime = now // Reset to avoid continuous triggering
+                    }
+                } else {
+                    isConditionMet = false
+                }
                 
                 if (isRecording) {
                     if (recordingStartTimeNs == -1L) recordingStartTimeNs = event.timestamp
                     val timeS = (event.timestamp - recordingStartTimeNs) / 1_000_000_000.0
-                    val am = sqrt(lastAccel[0]*lastAccel[0] + lastAccel[1]*lastAccel[1] + lastAccel[2]*lastAccel[2])
                     val gm = sqrt(lastGyro[0]*lastGyro[0] + lastGyro[1]*lastGyro[1] + lastGyro[2]*lastGyro[2])
                     val mm = sqrt(lastMag[0]*lastMag[0] + lastMag[1]*lastMag[1] + lastMag[2]*lastMag[2])
 
-                    dataQueue.offer(String.format(Locale.US, "%d,%.3f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,0",
+                    dataQueue.offer(String.format(Locale.US, "%d,%.3f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%d",
                         event.timestamp, timeS, lastAccel[0], lastAccel[1], lastAccel[2], am,
-                        lastGyro[0], lastGyro[1], lastGyro[2], gm, lastMag[0], lastMag[1], lastMag[2], mm, currentBatteryTemp))
+                        lastGyro[0], lastGyro[1], lastGyro[2], gm, lastMag[0], lastMag[1], lastMag[2], mm, currentBatteryTemp, triggerCount))
                 }
             }
             Sensor.TYPE_GYROSCOPE -> {
@@ -206,6 +235,28 @@ class IMURecorderService : Service(), SensorEventListener {
             Sensor.TYPE_MAGNETIC_FIELD -> {
                 lastMag[0] = event.values[0]; lastMag[1] = event.values[1]; lastMag[2] = event.values[2]
             }
+        }
+    }
+
+    fun incrementTrigger() {
+        triggerCount++
+        playTriggerFeedback()
+    }
+
+    private fun playTriggerFeedback() {
+        // Sound
+        val toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
+
+        // Flashlight
+        val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val cameraId = cameraManager.cameraIdList[0]
+                cameraManager.setTorchMode(cameraId, true)
+                delay(200)
+                cameraManager.setTorchMode(cameraId, false)
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
@@ -221,4 +272,5 @@ class IMURecorderService : Service(), SensorEventListener {
     fun getCurrentHz() = currentHz
     fun isRecording() = isRecording
     fun getOutputFile() = outputFile
+    fun getTriggerCount() = triggerCount
 }
