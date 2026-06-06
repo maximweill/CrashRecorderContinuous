@@ -3,11 +3,11 @@ package com.example.crashrecordercontinuous
 import android.Manifest
 import android.content.*
 import android.content.pm.PackageManager
+import android.hardware.Sensor
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -16,14 +16,21 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import com.example.crashrecordercontinuous.trigger.*
 import com.example.crashrecordercontinuous.ui.theme.CrashRecorderContinuousTheme
 import kotlinx.coroutines.delay
 import java.io.File
@@ -52,7 +59,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         val intent = Intent(this, IMURecorderService::class.java)
-        bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        bindService(intent, connection, BIND_AUTO_CREATE)
 
         setContent {
             CrashRecorderContinuousTheme {
@@ -76,6 +83,17 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+enum class StrategyOption(val label: String) {
+    MAGNITUDE("Magnitude (>20 m/s²)"),
+    Y_AXIS_DURATION("Vertical (2s)")
+}
+
+enum class ResponseOption(val label: String) {
+    SOUND("Sound Beep"),
+    FLASH("Camera Flash"),
+    NONE("None")
+}
+
 @Composable
 fun IMURecorderScreen(
     modifier: Modifier = Modifier,
@@ -83,11 +101,14 @@ fun IMURecorderScreen(
     isBound: Boolean
 ) {
     val context = LocalContext.current
-    val deviceName = remember {
-        Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME) ?: "Phone000"
-    }
     var isRecording by remember { mutableStateOf(false) }
-    var fileNameInput by remember { mutableStateOf(deviceName) }
+
+    var accelEnabled by remember { mutableStateOf(true) }
+    var gyroEnabled by remember { mutableStateOf(true) }
+    var magEnabled by remember { mutableStateOf(true) }
+
+    var selectedStrategy by remember { mutableStateOf(StrategyOption.MAGNITUDE) }
+    var selectedResponse by remember { mutableStateOf(ResponseOption.SOUND) }
 
     var accelText by remember { mutableStateOf("Accel: Waiting...") }
     var gyroText by remember { mutableStateOf("Gyro: Waiting...") }
@@ -112,13 +133,13 @@ fun IMURecorderScreen(
                 triggerCount = imuService.getTriggerCount()
                 
                 val accel = imuService.getCurrentAccel()
-                accelText = String.format(Locale.US, "Accel (g): X: %.3f, Y: %.3f, Z: %.3f", accel[0], accel[1], accel[2])
+                accelText = String.format(Locale.US, "Accel: X: %.3f, Y: %.3f, Z: %.3f", accel[0], accel[1], accel[2])
                 
                 val gyro = imuService.getCurrentGyro()
-                gyroText = String.format(Locale.US, "Gyro (dps): X: %.2f, Y: %.2f, Z: %.2f", gyro[0], gyro[1], gyro[2])
+                gyroText = String.format(Locale.US, "Gyro: X: %.2f, Y: %.2f, Z: %.2f", gyro[0], gyro[1], gyro[2])
 
                 val mag = imuService.getCurrentMag()
-                magText = String.format(Locale.US, "Mag (uT): X: %.1f, Y: %.1f, Z: %.1f", mag[0], mag[1], mag[2])
+                magText = String.format(Locale.US, "Mag: X: %.1f, Y: %.1f, Z: %.1f", mag[0], mag[1], mag[2])
 
                 hzText = String.format(Locale.US, "Sampling Rate: %.1f Hz", imuService.getCurrentHz())
                 
@@ -129,14 +150,14 @@ fun IMURecorderScreen(
         }
     }
 
-    // Background color turns red when recording
     val backgroundColor = if (isRecording) Color(0xFFcb1725) else MaterialTheme.colorScheme.background
 
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(backgroundColor)
-            .padding(16.dp),
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Row(
@@ -159,13 +180,78 @@ fun IMURecorderScreen(
             }
         }
 
-        OutlinedTextField(
-            value = fileNameInput,
-            onValueChange = { fileNameInput = it },
-            label = { Text("File Name Suffix") },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = !isRecording
-        )
+        Text("Active Sensors", style = MaterialTheme.typography.titleMedium)
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(8.dp)) {
+                SensorToggle("Accelerometer", accelEnabled, onCheckedChange = { accelEnabled = it }, enabled = !isRecording)
+                SensorToggle("Gyroscope", gyroEnabled, onCheckedChange = { gyroEnabled = it }, enabled = !isRecording)
+                SensorToggle("Magnetometer", magEnabled, onCheckedChange = { magEnabled = it }, enabled = !isRecording)
+            }
+        }
+
+        Text("Trigger Strategy", style = MaterialTheme.typography.titleMedium)
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.selectableGroup().padding(8.dp)) {
+                StrategyOption.entries.forEach { option ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .selectable(
+                                selected = (selectedStrategy == option),
+                                onClick = { selectedStrategy = option },
+                                role = Role.RadioButton,
+                                enabled = !isRecording
+                            )
+                            .padding(horizontal = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = (selectedStrategy == option),
+                            onClick = null,
+                            enabled = !isRecording
+                        )
+                        Text(
+                            text = option.label,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.padding(start = 16.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        Text("Trigger Response", style = MaterialTheme.typography.titleMedium)
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.selectableGroup().padding(8.dp)) {
+                ResponseOption.entries.forEach { option ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .selectable(
+                                selected = (selectedResponse == option),
+                                onClick = { selectedResponse = option },
+                                role = Role.RadioButton,
+                                enabled = !isRecording
+                            )
+                            .padding(horizontal = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = (selectedResponse == option),
+                            onClick = null,
+                            enabled = !isRecording
+                        )
+                        Text(
+                            text = option.label,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.padding(start = 16.dp)
+                        )
+                    }
+                }
+            }
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -180,9 +266,33 @@ fun IMURecorderScreen(
                         }
                     }
 
+                    val enabledSensors = mutableSetOf<Int>()
+                    if (accelEnabled) enabledSensors.add(Sensor.TYPE_ACCELEROMETER)
+                    if (gyroEnabled) enabledSensors.add(Sensor.TYPE_GYROSCOPE)
+                    if (magEnabled) enabledSensors.add(Sensor.TYPE_MAGNETIC_FIELD)
+
+                    if (enabledSensors.isEmpty()) {
+                        Toast.makeText(context, "Select at least one sensor", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+
+                    // Update strategy and response in service
+                    val strategy = when(selectedStrategy) {
+                        StrategyOption.MAGNITUDE -> Triggers.magnitude(20.0)
+                        StrategyOption.Y_AXIS_DURATION -> Triggers.yAxisDuration(2.0)
+                    }
+                    val response = when(selectedResponse) {
+                        ResponseOption.SOUND -> Responses.sound
+                        ResponseOption.FLASH -> Responses.flash
+                        ResponseOption.NONE -> Responses.none
+                    }
+                    
+                    imuService?.setTriggerStrategy(strategy)
+                    imuService?.setTriggerResponse(response)
+
                     val intent = Intent(context, IMURecorderService::class.java)
                     context.startForegroundService(intent)
-                    imuService?.startRecording(fileNameInput)
+                    imuService?.startRecording(enabledSensors)
                 },
                 enabled = isBound && !isRecording,
                 modifier = Modifier.weight(1f)
@@ -203,11 +313,7 @@ fun IMURecorderScreen(
 
         Button(
             onClick = {
-                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                    permissionLauncher.launch(Manifest.permission.CAMERA)
-                } else {
-                    imuService?.incrementTrigger()
-                }
+                imuService?.incrementTrigger()
             },
             enabled = isBound,
             modifier = Modifier.fillMaxWidth(),
@@ -218,9 +324,11 @@ fun IMURecorderScreen(
 
         Button(
             onClick = {
-                val file = imuService?.getOutputFile() ?: context.getExternalFilesDir(null)?.listFiles { _, name -> name.endsWith(".csv") }?.maxByOrNull { it.lastModified() }
-                if (file != null && file.exists()) {
-                    shareFile(context, file)
+                val directory = context.getExternalFilesDir(null)
+                val files = directory?.listFiles { _, name -> name.endsWith(".csv") }
+                if (files != null && files.isNotEmpty()) {
+                    val latestFile = files.maxByOrNull { it.lastModified() }
+                    latestFile?.let { shareFile(context, it) }
                 } else {
                     Toast.makeText(context, "No recording found to share", Toast.LENGTH_SHORT).show()
                 }
@@ -228,8 +336,20 @@ fun IMURecorderScreen(
             enabled = !isRecording,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Share Data")
+            Text("Share Latest Data")
         }
+    }
+}
+
+@Composable
+fun SensorToggle(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit, enabled: Boolean) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(text = label)
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
     }
 }
 

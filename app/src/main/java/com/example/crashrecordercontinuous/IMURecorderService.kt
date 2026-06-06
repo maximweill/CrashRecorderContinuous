@@ -4,40 +4,32 @@ import android.app.*
 import android.content.*
 import android.content.pm.ServiceInfo
 import android.hardware.*
-import android.hardware.camera2.CameraManager
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.*
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
+import com.example.crashrecordercontinuous.trigger.*
 import kotlinx.coroutines.*
 import java.io.*
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
-import kotlin.math.abs
-import kotlin.math.sqrt
 
 class IMURecorderService : Service(), SensorEventListener {
 
     private lateinit var sensorManager: SensorManager
-    private var accelSensor: Sensor? = null
-    private var gyroSensor: Sensor? = null
-    private var magSensor: Sensor? = null
+    private lateinit var sensors: DeviceSensors
     private var wakeLock: PowerManager.WakeLock? = null
 
     private var isRecording = false
-    private var fileName: String = ""
-    private var outputFile: File? = null
-    private var writer: BufferedWriter? = null
-
-    private val dataQueue = ConcurrentLinkedQueue<String>()
+    private val sensorWriters = mutableMapOf<Int, BufferedWriter>()
+    private val dataQueues = mutableMapOf<Int, ConcurrentLinkedQueue<String>>()
     private var recordingJob: Job? = null
     private var batteryJob: Job? = null
 
     private var currentBatteryTemp = 0f
-    private var recordingStartTimeNs = -1L
+    private val recordingStartTimeNs = mutableMapOf<Int, Long>()
 
-    // Sampling rate calculation
+    // Sampling rate calculation (UI only, using accelerometer as proxy or average)
     private var sampleCount = 0
     private var lastHzCalcTime = 0L
     private var currentHz = 0.0
@@ -48,10 +40,12 @@ class IMURecorderService : Service(), SensorEventListener {
     private var lastMag = FloatArray(3)
 
     // Trigger logic
-    private var triggerCount = 0
-    private var conditionStartTime: Long = 0
-    private val conditionDurationThreshold = 30000L // 30 seconds
-    private var isConditionMet = false
+    private var triggerCount = 0.0
+    private var triggerContext = TriggerContext()
+    private var activeStrategy: TriggerStrategy = Triggers.magnitude(20.0)
+    private var activeResponse: TriggerResponse = Responses.sound
+
+    private val sensorListeners = mutableMapOf<Int, SensorEventListener>()
 
     inner class LocalBinder : Binder() {
         fun getService(): IMURecorderService = this@IMURecorderService
@@ -61,21 +55,43 @@ class IMURecorderService : Service(), SensorEventListener {
 
     override fun onCreate() {
         super.onCreate()
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-        magSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        sensors = SensorProvider.provideSensors(this)
 
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "IMURecorder:WakeLock")
         
-        registerAllListeners(SensorManager.SENSOR_DELAY_UI)
+        // Register listeners for UI updates immediately
+        registerUIListeners()
     }
 
-    private fun registerAllListeners(delay: Int) {
-        sensorManager.registerListener(this, accelSensor, delay)
-        sensorManager.registerListener(this, gyroSensor, delay)
-        sensorManager.registerListener(this, magSensor, delay)
+    override fun onSensorChanged(event: SensorEvent) {
+        updateLastValues(event)
+        if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+            sampleCount++
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastHzCalcTime >= 1000) {
+                currentHz = sampleCount.toDouble() / ((now - lastHzCalcTime) / 1000.0)
+                sampleCount = 0
+                lastHzCalcTime = now
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    private fun registerUIListeners() {
+        sensorManager.registerListener(this, sensors.accel, SensorManager.SENSOR_DELAY_UI)
+        sensorManager.registerListener(this, sensors.gyro, SensorManager.SENSOR_DELAY_UI)
+        sensorManager.registerListener(this, sensors.mag, SensorManager.SENSOR_DELAY_UI)
+    }
+
+    private fun updateLastValues(event: SensorEvent) {
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> System.arraycopy(event.values, 0, lastAccel, 0, 3)
+            Sensor.TYPE_GYROSCOPE -> System.arraycopy(event.values, 0, lastGyro, 0, 3)
+            Sensor.TYPE_MAGNETIC_FIELD -> System.arraycopy(event.values, 0, lastMag, 0, 3)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -85,14 +101,12 @@ class IMURecorderService : Service(), SensorEventListener {
 
     private fun startForegroundServiceInternal() {
         val channelId = "IMU_RECORDER_CHANNEL"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "IMU Recorder", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
+        val channel = NotificationChannel(channelId, "IMU Recorder", NotificationManager.IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("IMU Recorder Active")
-            .setContentText(if (isRecording) "Recording IMU to $fileName" else "Ready")
+            .setContentText(if (isRecording) "Recording sensor data..." else "Ready")
             .setSmallIcon(android.R.drawable.ic_menu_save)
             .setOngoing(true)
             .build()
@@ -104,49 +118,89 @@ class IMURecorderService : Service(), SensorEventListener {
         }
     }
 
-    fun startRecording(customName: String): String {
-        if (isRecording) return fileName
+    fun startRecording(enabledSensors: Set<Int>) {
+        if (isRecording) return
         
-        sensorManager.unregisterListener(this)
-        registerAllListeners(SensorManager.SENSOR_DELAY_FASTEST)
-
+        sensorManager.unregisterListener(this) // Unregister UI listeners
+        
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val nameSuffix = if (customName.isNotEmpty()) "_$customName" else ""
-        fileName = "continuous_${timeStamp}${nameSuffix}.csv"
+        val deviceName = Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) ?: "Phone000"
         
-        outputFile = File(getExternalFilesDir(null), fileName)
+        recordingStartTimeNs.clear()
+        triggerCount = 0.0
+        triggerContext = TriggerContext()
         
-        try {
-            writer = BufferedWriter(FileWriter(outputFile, true))
-            writer?.write("# Device: ${Build.MANUFACTURER} ${Build.MODEL}\n")
-            writer?.write("# Accelerometer: ${accelSensor?.vendor} ${accelSensor?.name}\n")
-            writer?.write("# Gyroscope: ${gyroSensor?.vendor} ${gyroSensor?.name}\n")
-            writer?.write("# Magnetometer: ${magSensor?.vendor} ${magSensor?.name}\n")
-            writer?.write("time_ns,time_s,accelX_g,accelY_g,accelZ_g,accelMag_g,gyroX_dps,gyroY_dps,gyroZ_dps,gyroMag_dps,magX_uT,magY_uT,magZ_uT,magMag_uT,batt_temp_c,triggered\n")
-            writer?.flush()
-        } catch (e: Exception) { e.printStackTrace() }
+        sensors.getEnabledSensors(enabledSensors).forEach { sensor ->
+            val sensorType = sensor.type
+            val sensorName = SensorProvider.getSensorName(sensorType)
+            
+            val fileName = StorageProvider.generateFileName(timeStamp, deviceName, sensorName)
+            val outputFile = File(getExternalFilesDir(null), fileName)
+            
+            try {
+                val writer = BufferedWriter(FileWriter(outputFile, true))
+                writer.write(StorageProvider.getCsvHeader(sensors, sensorType, sensorName))
+                writer.flush()
+                sensorWriters[sensorType] = writer
+                dataQueues[sensorType] = ConcurrentLinkedQueue<String>()
+            } catch (e: Exception) { e.printStackTrace() }
 
-        recordingStartTimeNs = -1L
-        sampleCount = 0
-        lastHzCalcTime = SystemClock.elapsedRealtime()
-        currentHz = 0.0
-        triggerCount = 0
-        conditionStartTime = 0
-        isConditionMet = false
+            val listener = object : SensorEventListener {
+                override fun onSensorChanged(event: SensorEvent) {
+                    updateLastValues(event)
+                    
+                    // Evaluate trigger logic
+                    val sample = SensorSample(
+                        accel = if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) event.values.clone() else lastAccel.clone(),
+                        gyro = if (event.sensor.type == Sensor.TYPE_GYROSCOPE) event.values.clone() else lastGyro.clone(),
+                        mag = if (event.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) event.values.clone() else lastMag.clone(),
+                        timestampNs = event.timestamp
+                    )
+                    
+                    val result = activeStrategy(sample, triggerContext)
+                    if (result.triggerIncrement > 0) {
+                        triggerCount += result.triggerIncrement
+                        activeResponse(this@IMURecorderService)
+                    }
+                    triggerContext = result.newContext
+
+                    if (recordingStartTimeNs[sensorType] == null) recordingStartTimeNs[sensorType] = event.timestamp
+                    val startTime = recordingStartTimeNs[sensorType] ?: event.timestamp
+                    val timeS = (event.timestamp - startTime) / 1_000_000_000.0
+                    
+                    val data = StorageProvider.formatCsvLine(
+                        event.timestamp,
+                        timeS,
+                        event.values,
+                        currentBatteryTemp,
+                        triggerCount
+                    )
+                    
+                    dataQueues[sensorType]?.offer(data)
+                }
+                override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+            }
+            sensorListeners[sensorType] = listener
+            sensorManager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_FASTEST)
+        }
+
         isRecording = true
-        wakeLock?.acquire()
+        wakeLock?.acquire(10 * 60 * 1000L /* 10 minutes */)
         startForegroundServiceInternal()
 
         recordingJob = CoroutineScope(Dispatchers.IO).launch {
             while (isActive && isRecording) {
                 try {
-                    var count = 0
-                    while (dataQueue.isNotEmpty()) {
-                        writer?.write(dataQueue.poll() ?: "")
-                        writer?.newLine()
-                        if (++count > 1000) break
+                    sensorWriters.forEach { (type, writer) ->
+                        val queue = dataQueues[type] ?: return@forEach
+                        var count = 0
+                        while (queue.isNotEmpty()) {
+                            writer.write(queue.poll() ?: "")
+                            writer.newLine()
+                            if (++count > 1000) break
+                        }
+                        if (count > 0) writer.flush()
                     }
-                    if (count > 0) writer?.flush()
                 } catch (e: Exception) { e.printStackTrace() }
                 delay(500)
             }
@@ -158,14 +212,17 @@ class IMURecorderService : Service(), SensorEventListener {
                 delay(5000)
             }
         }
-        return fileName
     }
 
     fun stopRecording() {
         if (!isRecording) return
         isRecording = false
-        sensorManager.unregisterListener(this)
-        registerAllListeners(SensorManager.SENSOR_DELAY_UI)
+        
+        sensorListeners.values.forEach { sensorManager.unregisterListener(it) }
+        sensorListeners.clear()
+        
+        // Register UI listeners again
+        registerUIListeners()
         
         if (wakeLock?.isHeld == true) wakeLock?.release()
         recordingJob?.cancel()
@@ -173,91 +230,33 @@ class IMURecorderService : Service(), SensorEventListener {
         
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                while (dataQueue.isNotEmpty()) {
-                    writer?.write(dataQueue.poll() ?: "")
-                    writer?.newLine()
+                sensorWriters.forEach { (type, writer) ->
+                    val queue = dataQueues[type] ?: return@forEach
+                    while (queue.isNotEmpty()) {
+                        writer.write(queue.poll() ?: "")
+                        writer.newLine()
+                    }
+                    writer.flush()
+                    writer.close()
                 }
-                writer?.flush(); writer?.close(); writer = null
+                sensorWriters.clear()
+                dataQueues.clear()
             } catch (e: Exception) { e.printStackTrace() }
         }
         startForegroundServiceInternal()
     }
 
-    override fun onSensorChanged(event: SensorEvent) {
-        when (event.sensor.type) {
-            Sensor.TYPE_ACCELEROMETER -> {
-                lastAccel[0] = event.values[0] / 9.81f
-                lastAccel[1] = event.values[1] / 9.81f
-                lastAccel[2] = event.values[2] / 9.81f
-                
-                // Rate calculation
-                sampleCount++
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastHzCalcTime >= 1000) {
-                    currentHz = sampleCount.toDouble() / ((now - lastHzCalcTime) / 1000.0)
-                    sampleCount = 0
-                    lastHzCalcTime = now
-                }
+    fun setTriggerStrategy(strategy: TriggerStrategy) {
+        activeStrategy = strategy
+    }
 
-                val am = sqrt(lastAccel[0]*lastAccel[0] + lastAccel[1]*lastAccel[1] + lastAccel[2]*lastAccel[2])
-                
-                // Stand upright condition: Mag ~ 1g AND -accelY ~ 1g
-                val currentConditionMet = abs(am - 1.0f) < 0.15f && abs(-lastAccel[1] - 1.0f) < 0.15f
-                
-                if (currentConditionMet) {
-                    if (!isConditionMet) {
-                        isConditionMet = true
-                        conditionStartTime = now
-                    } else if (now - conditionStartTime > conditionDurationThreshold) {
-                        incrementTrigger()
-                        conditionStartTime = now // Reset to avoid continuous triggering
-                    }
-                } else {
-                    isConditionMet = false
-                }
-                
-                if (isRecording) {
-                    if (recordingStartTimeNs == -1L) recordingStartTimeNs = event.timestamp
-                    val timeS = (event.timestamp - recordingStartTimeNs) / 1_000_000_000.0
-                    val gm = sqrt(lastGyro[0]*lastGyro[0] + lastGyro[1]*lastGyro[1] + lastGyro[2]*lastGyro[2])
-                    val mm = sqrt(lastMag[0]*lastMag[0] + lastMag[1]*lastMag[1] + lastMag[2]*lastMag[2])
-
-                    dataQueue.offer(String.format(Locale.US, "%d,%.3f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%d",
-                        event.timestamp, timeS, lastAccel[0], lastAccel[1], lastAccel[2], am,
-                        lastGyro[0], lastGyro[1], lastGyro[2], gm, lastMag[0], lastMag[1], lastMag[2], mm, currentBatteryTemp, triggerCount))
-                }
-            }
-            Sensor.TYPE_GYROSCOPE -> {
-                lastGyro[0] = event.values[0] * 57.2958f
-                lastGyro[1] = event.values[1] * 57.2958f
-                lastGyro[2] = event.values[2] * 57.2958f
-            }
-            Sensor.TYPE_MAGNETIC_FIELD -> {
-                lastMag[0] = event.values[0]; lastMag[1] = event.values[1]; lastMag[2] = event.values[2]
-            }
-        }
+    fun setTriggerResponse(response: TriggerResponse) {
+        activeResponse = response
     }
 
     fun incrementTrigger() {
-        triggerCount++
-        playTriggerFeedback()
-    }
-
-    private fun playTriggerFeedback() {
-        // Sound
-        val toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-        toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
-
-        // Flashlight
-        val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val cameraId = cameraManager.cameraIdList[0]
-                cameraManager.setTorchMode(cameraId, true)
-                delay(200)
-                cameraManager.setTorchMode(cameraId, false)
-            } catch (e: Exception) { e.printStackTrace() }
-        }
+        triggerCount += 1.0
+        activeResponse(this)
     }
 
     private fun updateBatteryTemp() {
@@ -265,12 +264,19 @@ class IMURecorderService : Service(), SensorEventListener {
         currentBatteryTemp = (batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10.0f
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onDestroy() {
+        super.onDestroy()
+        sensorManager.unregisterListener(this)
+        sensorListeners.values.forEach { sensorManager.unregisterListener(it) }
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        recordingJob?.cancel()
+        batteryJob?.cancel()
+    }
+
     fun getCurrentAccel() = lastAccel
     fun getCurrentGyro() = lastGyro
     fun getCurrentMag() = lastMag
     fun getCurrentHz() = currentHz
     fun isRecording() = isRecording
-    fun getOutputFile() = outputFile
-    fun getTriggerCount() = triggerCount
+    fun getTriggerCount() = triggerCount.toInt()
 }
