@@ -8,6 +8,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -20,6 +22,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -84,8 +88,11 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class StrategyOption(val label: String) {
-    MAGNITUDE("Magnitude (>20 m/s²)"),
-    Y_AXIS_DURATION("Vertical (2s)")
+    IMPACT_HIGH("Impact High (16g)"),
+    IMPACT_MED("Impact Med (8g)"),
+    PORTRAIT_UP("Portrait Up"),
+    PORTRAIT_DOWN("Portrait Down"),
+    FACE_DOWN("Face Down")
 }
 
 enum class ResponseOption(val label: String) {
@@ -107,7 +114,7 @@ fun IMURecorderScreen(
     var gyroEnabled by remember { mutableStateOf(true) }
     var magEnabled by remember { mutableStateOf(true) }
 
-    var selectedStrategy by remember { mutableStateOf(StrategyOption.MAGNITUDE) }
+    var selectedStrategy by remember { mutableStateOf(StrategyOption.IMPACT_MED) }
     var selectedResponse by remember { mutableStateOf(ResponseOption.SOUND) }
 
     var accelText by remember { mutableStateOf("Accel: Waiting...") }
@@ -117,12 +124,19 @@ fun IMURecorderScreen(
     var statusText by remember { mutableStateOf("Status: Not Connected") }
     var triggerCount by remember { mutableIntStateOf(0) }
 
+    var isBatteryOptimized by remember { mutableStateOf(false) }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         if (!isGranted) {
             Toast.makeText(context, "Permission required", Toast.LENGTH_LONG).show()
         }
+    }
+
+    LaunchedEffect(Unit) {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        isBatteryOptimized = !pm.isIgnoringBatteryOptimizations(context.packageName)
     }
 
     LaunchedEffect(isBound, imuService) {
@@ -160,6 +174,33 @@ fun IMURecorderScreen(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        if (isBatteryOptimized) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Warning, contentDescription = "Warning", tint = MaterialTheme.colorScheme.error)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Battery optimization is enabled. This may stop recording in the background.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        TextButton(onClick = {
+                            val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                            context.startActivity(intent)
+                        }) {
+                            Text("Disable Optimization")
+                        }
+                    }
+                }
+            }
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
@@ -278,8 +319,11 @@ fun IMURecorderScreen(
 
                     // Update strategy and response in service
                     val strategy = when(selectedStrategy) {
-                        StrategyOption.MAGNITUDE -> Triggers.magnitude(20.0)
-                        StrategyOption.Y_AXIS_DURATION -> Triggers.yAxisDuration(2.0)
+                        StrategyOption.IMPACT_HIGH -> Triggers.magnitude(157.0)
+                        StrategyOption.IMPACT_MED -> Triggers.magnitude(78.5)
+                        StrategyOption.PORTRAIT_UP -> Triggers.axisDuration(1, 2.0, 9.0)
+                        StrategyOption.PORTRAIT_DOWN -> Triggers.axisDuration(1, 2.0, -9.0)
+                        StrategyOption.FACE_DOWN -> Triggers.axisDuration(2, 2.0, -9.0)
                     }
                     val response = when(selectedResponse) {
                         ResponseOption.SOUND -> Responses.sound

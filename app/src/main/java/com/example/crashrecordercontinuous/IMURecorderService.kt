@@ -42,7 +42,7 @@ class IMURecorderService : Service(), SensorEventListener {
     // Trigger logic
     private var triggerCount = 0.0
     private var triggerContext = TriggerContext()
-    private var activeStrategy: TriggerStrategy = Triggers.magnitude(20.0)
+    private var activeStrategy: TriggerStrategy = Triggers.magnitude(78.5)
     private var activeResponse: TriggerResponse = Responses.sound
 
     private val sensorListeners = mutableMapOf<Int, SensorEventListener>()
@@ -102,10 +102,11 @@ class IMURecorderService : Service(), SensorEventListener {
     private fun startForegroundServiceInternal() {
         val channelId = "IMU_RECORDER_CHANNEL"
         val channel = NotificationChannel(channelId, "IMU Recorder", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.createNotificationChannel(channel)
 
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("IMU Recorder Active")
+            .setContentTitle("Crash Recorder Active")
             .setContentText(if (isRecording) "Recording sensor data..." else "Ready")
             .setSmallIcon(android.R.drawable.ic_menu_save)
             .setOngoing(true)
@@ -148,6 +149,7 @@ class IMURecorderService : Service(), SensorEventListener {
             val listener = object : SensorEventListener {
                 override fun onSensorChanged(event: SensorEvent) {
                     updateLastValues(event)
+                    if (event.sensor.type != sensorType) return
                     
                     // Evaluate trigger logic
                     val sample = SensorSample(
@@ -185,7 +187,7 @@ class IMURecorderService : Service(), SensorEventListener {
         }
 
         isRecording = true
-        wakeLock?.acquire(10 * 60 * 1000L /* 10 minutes */)
+        wakeLock?.acquire()
         startForegroundServiceInternal()
 
         recordingJob = CoroutineScope(Dispatchers.IO).launch {

@@ -38,32 +38,34 @@ object Triggers {
     }
 
     /**
-     * Triggers if the device is held vertically (Y-axis > ~9.0 m/s^2) for [seconds] continuously.
-     * Uses [TriggerContext.variables] to track state without mutable member variables.
+     * Triggers if a specific axis meets [targetValue] for [seconds] continuously.
+     * [axisIndex] 0=X, 1=Y, 2=Z.
+     * If [targetValue] is positive, it checks if value > [targetValue].
+     * If [targetValue] is negative, it checks if value < [targetValue].
      */
-    fun yAxisDuration(seconds: Double): TriggerStrategy = { sample, context ->
+    fun axisDuration(axisIndex: Int, seconds: Double, targetValue: Double): TriggerStrategy = { sample, context ->
         var increment = 0.0
         val newVars = context.variables.toMutableMap()
-        val thresholdY = 9.0
         val durationNs = (seconds * 1_000_000_000).toLong()
 
         sample.accel?.let { accel ->
-            val y = accel[1]
-            if (y > thresholdY) {
-                val startTime = context.variables["y_start_time"] as? Long ?: sample.timestampNs
-                newVars["y_start_time"] = startTime
+            val value = accel[axisIndex]
+            val isMet = if (targetValue >= 0) value > targetValue else value < targetValue
+            
+            if (isMet) {
+                val startTime = context.variables["axis_start_time"] as? Long ?: sample.timestampNs
+                newVars["axis_start_time"] = startTime
                 
                 val elapsed = sample.timestampNs - startTime
-                val alreadyTriggered = context.variables["y_triggered"] as? Boolean ?: false
+                val alreadyTriggered = context.variables["axis_triggered"] as? Boolean ?: false
                 
                 if (elapsed >= durationNs && !alreadyTriggered) {
                     increment = 1.0
-                    newVars["y_triggered"] = true
+                    newVars["axis_triggered"] = true
                 }
             } else {
-                // Reset tracking when phone is no longer vertical
-                newVars.remove("y_start_time")
-                newVars.remove("y_triggered")
+                newVars.remove("axis_start_time")
+                newVars.remove("axis_triggered")
             }
         }
 
